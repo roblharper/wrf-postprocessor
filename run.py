@@ -1,0 +1,136 @@
+"""Orchestrate: load a trained model, sweep a grid over time, write VTK flowfields.
+
+    model checkpoint + domain extents + grid resolution
+        -> evaluate the model on a regular grid at each requested time
+        -> denormalize to physical units
+        -> one binary .vtu per timestep + a .pvd collection
+
+HRRR conditions are not used yet (an input slot for later).
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import numpy as np
+
+from grid import build_grid
+from vtk_writer import write_timestep, write_collection
+
+log = logging.getLogger(__name__)
+
+#: Model state columns written as fields (the model also outputs k_m, dropped).
+STATE_NAMES: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime")
+
+#: Default evaluation bounds: the normalized [-1, 1] cube the model was trained on.
+DEFAULT_BOUNDS = {"x": (-1.0, 1.0), "y": (-1.0, 1.0), "z": (-1.0, 1.0), "t": (-1.0, 1.0)}
+
+
+def run(
+    model,
+    out_dir: str | Path,
+    *,
+    bounds: dict[str, tuple[float, float]] = DEFAULT_BOUNDS,
+    resolution: tuple[int, int, int] = (32, 32, 16),
+    times=(-1.0, 0.0, 1.0),
+    recipe=None,
+    device: str = "cpu",
+) -> Path:
+    """Write a VTK flowfield time series; return the .pvd collection path.
+
+    ``bounds`` and ``times`` are in the model's (normalized) coordinate space.
+    ``recipe`` (a ``denormalize.Recipe`` or None) maps outputs and coordinates
+    back to physical units; without it, values are written as-is.
+    """
+    import torch
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    grid = build_grid(bounds, resolution)
+    coords_phys = _physical_coordinates(grid.points, recipe)
+
+    model.to(device).eval()
+    entries: list[tuple[float, str]] = []
+    for step, t in enumerate(times):
+        fields = _evaluate(model, grid.points, float(t), recipe, device, torch)
+        name = f"flowfield_{step:04d}.vtu"
+        write_timestep(out / name, coords_phys, grid.shape, fields)
+        entries.append((_physical_time(t, recipe), name))
+        log.info("wrote %s (t=%g, %d points)", name, t, grid.points.shape[0])
+
+    pvd = write_collection(out / "flowfield.pvd", entries)
+    log.info("wrote collection %s (%d timesteps)", pvd.name, len(entries))
+    return pvd
+
+
+def _evaluate(model, spatial_points, t, recipe, device, torch) -> dict[str, np.ndarray]:
+    """Run the model on (grid, t) and return denormalized per-point fields."""
+    n = spatial_points.shape[0]
+    coords = np.column_stack([spatial_points, np.full(n, t)]).astype(np.float32)
+    with torch.no_grad():
+        state = model(torch.as_tensor(coords, device=device)).cpu().numpy()
+
+    fields: dict[str, np.ndarray] = {}
+    for i, name in enumerate(STATE_NAMES):
+        fields[name] = _denorm(recipe, name, state[:, i])
+    fields["velocity"] = np.column_stack([fields["u"], fields["v"], fields["w"]])
+    return fields
+
+
+def _physical_coordinates(points: np.ndarray, recipe) -> np.ndarray:
+    """Denormalize the x/y/z grid coordinates so VTK shows real extents."""
+    return np.column_stack([
+        _denorm(recipe, "x", points[:, 0]),
+        _denorm(recipe, "y", points[:, 1]),
+        _denorm(recipe, "z", points[:, 2]),
+    ])
+
+
+def _physical_time(t, recipe) -> float:
+    return float(_denorm(recipe, "t", np.asarray([t]))[0])
+
+
+def _denorm(recipe, name: str, values: np.ndarray) -> np.ndarray:
+    """Apply the recipe if present and it knows the column, else pass through."""
+    if recipe is None:
+        return np.asarray(values)
+    try:
+        return recipe.denormalize(name, values)
+    except KeyError:
+        return np.asarray(values)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    from model_loader import load_model
+    from denormalize import Recipe
+
+    parser = argparse.ArgumentParser(
+        description="Write a trained PINN's flowfield over time as binary VTK.",
+    )
+    parser.add_argument("checkpoint", type=Path, help="Trained model .pt checkpoint.")
+    parser.add_argument("out_dir", type=Path, help="Output folder for .vtu + .pvd.")
+    parser.add_argument("--recipe", type=Path, default=None,
+                        help="Pre-processor metadata.json for denormalization.")
+    parser.add_argument("--resolution", type=int, nargs=3, default=(32, 32, 16),
+                        metavar=("NX", "NY", "NZ"), help="Grid resolution (default 32 32 16).")
+    parser.add_argument("--times", type=float, nargs="+", default=[-1.0, 0.0, 1.0],
+                        help="Normalized times to evaluate (default -1 0 1).")
+    parser.add_argument("-v", "--verbose", action="count", default=0)
+    args = parser.parse_args(argv)
+
+    level = [logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)]
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+
+    model = load_model(args.checkpoint)
+    recipe = Recipe.from_metadata(args.recipe) if args.recipe else None
+    pvd = run(model, args.out_dir, resolution=tuple(args.resolution),
+              times=args.times, recipe=recipe)
+    print(f"Wrote flowfield time series to {pvd}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
