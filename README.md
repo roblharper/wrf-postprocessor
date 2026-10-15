@@ -112,3 +112,30 @@ in normalized state units. Results carry hashes and source-unit labels.
 The reference is the stored decoded POD field. This does not measure raw-field
 truncation error, forecast accuracy, or predictive uncertainty. A shared basis
 fitted only on training data and a matched retraining study remain separate work.
+
+### Shared-basis reconstruction study
+
+Make both `wrf_pinn/src` and the `wrf-preprocessor` module directory importable
+through `PYTHONPATH`, then run:
+
+```sh
+python representation_study.py /path/to/conditioning_cases /path/to/study --ranks 0 2 4 8
+```
+
+The input contains `metadata.json`, `train/*.npz` and `test/*.npz` with POD fields,
+initial grid/coordinates and boundary coordinates. Train/test case IDs, tile IDs
+and window IDs must be disjoint; relative grid layouts must match. Metadata
+split membership is checked when available. Optional `selection.json` records
+original sources and hashes, with staged conditioning hashes verified before fit.
+
+Each variable gets a fixed training-fitted mean/basis for its whole initial field
+and another for its whole boundary field. `bases/*.npz` contains reusable arrays;
+`study.json` records source/basis hashes, selection, source-unit RMSE, skill versus
+the fixed training mean, and reconstructed spatial spread. Basis fitting never
+uses held-out fields. Reported rank counts case-level coefficients per field and
+is not equivalent to the current case-specific POD rank/budget.
+
+Reference fields are decoded existing POD fields. This does not measure original
+raw-field compression error. Existing normalization is retained and may include
+test cases. Small within-simulation reconstruction gains do not establish
+forecasting improvements, persistence skill, or calibrated uncertainty.
