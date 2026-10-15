@@ -36,6 +36,7 @@ def run(
     times=(-1.0, 0.0, 1.0),
     recipe=None,
     device: str = "cpu",
+    conditioning=None,
 ) -> Path:
     """Write a VTK flowfield time series; return the .pvd collection path.
 
@@ -54,7 +55,7 @@ def run(
     model.to(device).eval()
     entries: list[tuple[float, str]] = []
     for step, t in enumerate(times):
-        fields = _evaluate(model, grid.points, float(t), recipe, device, torch)
+        fields = _evaluate(model, grid.points, float(t), recipe, device, torch, conditioning)
         name = f"flowfield_{step:04d}.vtu"
         write_timestep(out / name, coords_phys, grid.shape, fields)
         entries.append((_physical_time(t, recipe), name))
@@ -65,15 +66,23 @@ def run(
     return pvd
 
 
-def _evaluate(model, spatial_points, t, recipe, device, torch) -> dict[str, np.ndarray]:
+def _evaluate(model, spatial_points, t, recipe, device, torch, conditioning=None) -> dict[str, np.ndarray]:
     """Run the model on (grid, t) and return denormalized per-point fields."""
     n = spatial_points.shape[0]
     coords = np.column_stack([spatial_points, np.full(n, t)]).astype(np.float32)
     with torch.no_grad():
-        state = model(torch.as_tensor(coords, device=device)).cpu().numpy()
+        from wrf_pinn.models.conditional import ConditionalModel
+        tensor = torch.as_tensor(coords, device=device, dtype=next(model.parameters()).dtype)
+        if isinstance(model, ConditionalModel):
+            if conditioning is None:
+                raise ValueError("Conditional model export requires a case conditioning latent.")
+            latent = torch.as_tensor(conditioning, device=device, dtype=tensor.dtype).reshape(1, -1)
+            state = model(tensor, latent).cpu().numpy()
+        else:
+            state = model(tensor).cpu().numpy()
 
     fields: dict[str, np.ndarray] = {}
-    for i, name in enumerate(STATE_NAMES):
+    for i, name in enumerate(getattr(model, "state_names", STATE_NAMES)):
         fields[name] = _denorm(recipe, name, state[:, i])
     fields["velocity"] = np.column_stack([fields["u"], fields["v"], fields["w"]])
     return fields
@@ -93,13 +102,10 @@ def _physical_time(t, recipe) -> float:
 
 
 def _denorm(recipe, name: str, values: np.ndarray) -> np.ndarray:
-    """Apply the recipe if present and it knows the column, else pass through."""
+    """Apply the recipe when supplied; missing columns indicate incompatible data."""
     if recipe is None:
         return np.asarray(values)
-    try:
-        return recipe.denormalize(name, values)
-    except KeyError:
-        return np.asarray(values)
+    return recipe.denormalize(name, values)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -114,6 +120,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("out_dir", type=Path, help="Output folder for .vtu + .pvd.")
     parser.add_argument("--recipe", type=Path, default=None,
                         help="Pre-processor metadata.json for denormalization.")
+    parser.add_argument("--case", type=Path, help="Conditional case .npz supplying the latent.")
+    parser.add_argument("--legacy-tanh", action="store_true",
+                        help="Explicitly allow old conditional checkpoints with assumed tanh architecture.")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--bounds", type=float, nargs=6,
+                        metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"),
+                        help="Normalized spatial bounds; default is the legacy [-1,1] cube.")
     parser.add_argument("--resolution", type=int, nargs=3, default=(32, 32, 16),
                         metavar=("NX", "NY", "NZ"), help="Grid resolution (default 32 32 16).")
     parser.add_argument("--times", type=float, nargs="+", default=[-1.0, 0.0, 1.0],
@@ -124,10 +137,16 @@ def main(argv: list[str] | None = None) -> int:
     level = [logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)]
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
-    model = load_model(args.checkpoint)
+    model = load_model(args.checkpoint, allow_legacy_conditional=args.legacy_tanh)
+    conditioning = None
+    if args.case:
+        from wrf_pinn.data.conditional_case import read_conditional_case
+        conditioning = read_conditional_case(args.case).z
     recipe = Recipe.from_metadata(args.recipe) if args.recipe else None
-    pvd = run(model, args.out_dir, resolution=tuple(args.resolution),
-              times=args.times, recipe=recipe)
+    bounds = (dict(zip(("x", "y", "z"), zip(args.bounds[::2], args.bounds[1::2])))
+              if args.bounds else DEFAULT_BOUNDS)
+    pvd = run(model, args.out_dir, bounds=bounds, resolution=tuple(args.resolution),
+              times=args.times, recipe=recipe, conditioning=conditioning, device=args.device)
     print(f"Wrote flowfield time series to {pvd}")
     return 0
 

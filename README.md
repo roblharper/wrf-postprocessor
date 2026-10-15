@@ -66,3 +66,32 @@ coordinates into physical extents.
 
 Python with `torch`, `numpy`, `meshio`, and the `wrf_pinn` package importable
 (for the model architecture).
+
+### Conditional checkpoint evaluation
+
+With `wrf_pinn` installed (or its `src` on `PYTHONPATH`), evaluate a dataset's
+`metadata.json` and `test/*.npz` using:
+
+```sh
+python evaluate.py model.pt /path/to/cases /path/to/results --device cpu --export-predictions
+```
+
+`evaluation.json` records source-unit errors, persistence skill, case/lead metrics,
+checkpoint/metadata hashes and provenance notices. Prediction exports preserve
+aligned targets, masks and normalized coordinates. `--batch-points` controls
+inference memory. Units omitted by the dataset remain `unknown`.
+
+New conditional checkpoints reconstruct their saved architecture. Historical
+conditional checkpoints need `--legacy-tanh` to explicitly assume tanh and canonical
+variable order; their training provenance cannot be verified. Legacy MLP
+`model_state_dict` checkpoints remain supported by the VTK loader.
+
+For conditional VTK export, supply `run.py --case case.npz --recipe metadata.json`.
+Grid bounds/times must match the model's normalization: the legacy VTK defaults
+are [-1,1]; conditional minmax_01 datasets use [0,1], so supply
+`--bounds 0 1 0 1 0 1 --times 0.25 0.5 0.75 1` as appropriate for the case
+(or explicit `bounds`/`times` in the Python API). A supplied recipe must contain every
+exported field. Case evaluation derives its query points directly from the case.
+
+These outputs evaluate deterministic predictions. Predictive intervals, coverage,
+calibration and uncertainty plots are not implemented by this first slice.
