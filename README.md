@@ -95,3 +95,20 @@ exported field. Case evaluation derives its query points directly from the case.
 
 These outputs evaluate deterministic predictions. Predictive intervals, coverage,
 calibration and uncertainty plots are not implemented by this first slice.
+
+### Conditioning representation audit
+
+```sh
+python conditioning_audit.py model.pt case.npz metadata.json audit.json --device cpu
+```
+
+Use `--legacy-tanh` only for known historical conditional checkpoints. This audit
+flips matching POD mode/coefficient signs, verifies identical decoded fields, and
+measures any prediction change. It also constructs mean-shifted fields with the
+same latent to demonstrate information omitted by coefficient-only conditioning.
+`--max-points` bounds deterministic inference sampling; `--mean-shift` is expressed
+in normalized state units. Results carry hashes and source-unit labels.
+
+The reference is the stored decoded POD field. This does not measure raw-field
+truncation error, forecast accuracy, or predictive uncertainty. A shared basis
+fitted only on training data and a matched retraining study remain separate work.
